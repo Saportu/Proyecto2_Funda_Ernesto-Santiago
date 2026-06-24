@@ -4,16 +4,22 @@ from typing import List, Optional
 from difflib import SequenceMatcher
 
 import pygame
-import serial
-import serial.tools.list_ports
+import socket
 
 ANCHO  = 900
 ALTO   = 650
 FPS    = 60
 TITULO = "StrangerTEC · Morse Translator"
 
-BAUDRATE      = 115200
-TIMEOUT_SERIAL = 0.1
+# ============================================================
+#   CONEXION CON LA PICO POR WIFI  (en vez de USB serial)
+# ============================================================
+# Poné aquí la MISMA IP y puerto que configuraste en la Pico.
+PICO_IP   = "192.168.43.169"
+PICO_PORT = 1234
+# ============================================================
+
+TIMEOUT_CONEXION = 4       # segundos para conectar el socket
 TIMEOUT_RESP  = 8
 UNIDAD_A = 0.2
 UNIDAD_B = 0.3
@@ -155,65 +161,86 @@ class CapturadorMorse:
     def traduccion(self):
         return morse_a_texto(self.morse_final)
 
-def detectar_puerto_pico():
-    for p in serial.tools.list_ports.comports():
-        desc = (p.description or "").lower()
-        hwid = (p.hwid or "").lower()
-        if "micropython" in desc or "2e8a" in hwid or "pico" in desc:
-            return p.device
-    return None
-
 
 class ConexionPico:
+    """Ahora habla con la Pico por WiFi (socket TCP) en vez de USB serial.
+    El protocolo de comandos es exactamente el mismo de antes."""
     def __init__(self):
-        self.ser          = None
-        self.conectada    = False
-        self._lock        = threading.Lock()
-        self._buffer      = []
-        self.morse_live   = ""
-        self.texto_pico   = ""
-        self.esperando    = False
-        self.modo_maqueta = "local"
-        self.ult_info     = None   # (letra, ascii, bits, suma, enable) de la ultima letra de B
-        self.enable_estado = None  # "1"/"0" del switch de habilitacion
+        self.sock          = None
+        self.conectada     = False
+        self._lock         = threading.Lock()
+        self._buffer       = []
+        self.morse_live    = ""
+        self.texto_pico    = ""
+        self.esperando     = False
+        self.modo_maqueta  = "local"
+        self.ult_info      = None   # (letra, ascii, bits, suma, enable) de la ultima letra de B
+        self.enable_estado = None   # "1"/"0" del switch de habilitacion
+        self._rx           = ""     # buffer de texto recibido sin procesar
 
-    def conectar(self, puerto=None):
-        if puerto is None:
-            puerto = detectar_puerto_pico()
-        if puerto is None:
-            return False
+    def conectar(self, ip=None, puerto=None):
+        ip     = ip or PICO_IP
+        puerto = puerto or PICO_PORT
+        # cerrar cualquier socket viejo antes de reintentar
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+        self.esperando = False
         try:
-            self.ser = serial.Serial(puerto, BAUDRATE, timeout=TIMEOUT_SERIAL)
-            time.sleep(1.5)
-            self.ser.reset_input_buffer()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(TIMEOUT_CONEXION)
+            s.connect((ip, puerto))
+            s.settimeout(None)
+            self.sock      = s
             self.conectada = True
+            self._rx       = ""
+            with self._lock:
+                self._buffer = []
             threading.Thread(target=self._leer, daemon=True).start()
             return True
-        except serial.SerialException:
+        except OSError:
+            self.sock      = None
+            self.conectada = False
             return False
 
     def desconectar(self):
         self.conectada = False
-        if self.ser and self.ser.is_open:
+        self.esperando = False
+        if self.sock:
             try:
-                self.ser.close()
+                self.sock.close()
             except Exception:
                 pass
+        self.sock = None
 
     def _leer(self):
-        while self.conectada and self.ser and self.ser.is_open:
+        try:
+            self.sock.settimeout(0.2)
+        except Exception:
+            return
+        while self.conectada and self.sock:
             try:
-                raw = self.ser.readline()
-                if not raw:
-                    continue
-                linea = raw.decode("utf-8", errors="ignore").strip()
-                if linea:
-                    self._clasificar(linea)
-            except serial.SerialException:
+                data = self.sock.recv(512)
+                if not data:
+                    self.conectada = False
+                    break
+                self._rx += data.decode("utf-8", errors="ignore")
+                while "\n" in self._rx:
+                    linea, self._rx = self._rx.split("\n", 1)
+                    linea = linea.strip()
+                    if linea:
+                        self._clasificar(linea)
+            except socket.timeout:
+                continue
+            except OSError:
                 self.conectada = False
                 break
-            except Exception:
-                pass
+        self.conectada = False
+        self.esperando = False
+        self.sock = None
 
     def _clasificar(self, linea):
         with self._lock:
@@ -231,13 +258,11 @@ class ConexionPico:
                 self.modo_maqueta = linea[5:].strip()
                 self._buffer.append(linea)
             elif linea.startswith("INFO:"):
-                # INFO:letra;ascii;bits;suma;enable  (cada letra del Jugador B)
                 p = linea[5:].split(";")
                 if len(p) == 5:
                     self.ult_info = (p[0], p[1], p[2], p[3], p[4])
                     self.enable_estado = p[4]
             elif linea.startswith("RES:"):
-                # RES:bits;suma;enable  (respuesta al comando BITS del modo prueba)
                 self._buffer.append(linea)
             elif linea.startswith("ENABLE:"):
                 self.enable_estado = linea[7:].strip()
@@ -246,12 +271,11 @@ class ConexionPico:
                 self._buffer.append(linea)
 
     def enviar(self, comando):
-        if self.ser and self.ser.is_open:
+        if self.sock and self.conectada:
             try:
-                self.ser.write((comando + "\n").encode())
-                self.ser.flush()
-            except Exception:
-                pass
+                self.sock.sendall((comando + "\n").encode())
+            except OSError:
+                self.conectada = False
 
     def esperar_respuesta(self, clave, timeout=TIMEOUT_RESP):
         t0 = time.time()
@@ -291,13 +315,13 @@ class ConexionPico:
         with self._lock:
             self.morse_live = ""
             self.texto_pico = ""
-            self.esperando  = True
             self.ult_info   = None
-        self.enviar("CAPTURAR")
+            self.esperando  = False
+        if self.sock and self.conectada:
+            self.enviar("CAPTURAR")
+            self.esperando = self.conectada
 
     def enviar_bits(self, bits_str):
-        """Manda los 4 bits a la maqueta (modo prueba). Ej: '0101'.
-        Devuelve (bits, suma, enable) o None."""
         self.enviar("BITS:" + bits_str)
         resp = self.esperar_respuesta("RES:", timeout=2)
         if resp:
@@ -689,7 +713,7 @@ def pantalla_partida(screen, clock, frase, pico, con_maqueta, unidad, modo_displ
 
     while True:
         elapsed      = time.time() - t0
-        pico_termino = con_maqueta and not pico.esperando
+        pico_termino = con_maqueta and (not pico.esperando or not pico.conectada)
 
         if confirmado_a and (not con_maqueta or pico_termino):
             break
@@ -727,7 +751,9 @@ def pantalla_partida(screen, clock, frase, pico, con_maqueta, unidad, modo_displ
             screen.blit(f_mor.render(mlive, True, BLANCO), (bx+8, 168))
             caja(screen, bx, 204, col_w, 34, COLOR_B)
             screen.blit(f_sml.render(morse_a_texto(pico.morse_live)[:28], True, VERDE_NEON), (bx+8, 213))
-            if pico_termino:
+            if not pico.conectada:
+                stb = f_sml.render("¡Maqueta desconectada!  Presiona ESC", True, ROJO_NEON)
+            elif pico_termino:
                 stb = f_sml.render("✓ CAPTURA TERMINADA", True, VERDE_NEON)
             else:
                 stb = f_sml.render("Esperando botón... (3s silencio = fin)", True, NARANJA)
@@ -782,7 +808,9 @@ def pantalla_partida(screen, clock, frase, pico, con_maqueta, unidad, modo_displ
     ta = t_a[0]
     if con_maqueta:
         with pico._lock:
-            rb = pico.texto_pico.strip()
+            rb = pico.texto_pico.strip() if (pico.conectada and not pico.esperando) else ""
+        if not pico.conectada:
+            rb = ""
         tb = time.time() - t0
     else:
         rb, tb = "", 0.0
@@ -987,6 +1015,8 @@ def pantalla_prueba(screen, clock, pico):
         header(screen, "MODO PRUEBA  -  CIRCUITO +5", f_tit)
 
         conectada = pico.conectada
+        if conectada and res is None:
+            res = enviar()
         est_txt = "Maqueta conectada" if conectada else "Sin maqueta (solo software)"
         screen.blit(f_sml.render(est_txt, True, VERDE_NEON if conectada else NARANJA), (40, 70))
 
